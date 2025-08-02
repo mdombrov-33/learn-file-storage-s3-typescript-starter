@@ -1,7 +1,7 @@
 import { rm } from "fs/promises";
 import path from "path";
 import { getBearerToken, validateJWT } from "../auth";
-import { getVideo, updateVideo } from "../db/videos";
+import { getVideo, updateVideo, type Video } from "../db/videos";
 import { respondWithJSON } from "./json";
 import { uploadVideoToS3 } from "../s3";
 import { BadRequestError, NotFoundError, UserForbiddenError } from "./errors";
@@ -42,30 +42,26 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
 
   const tempFilePath = path.join("/tmp", `${videoId}.mp4`);
   await Bun.write(tempFilePath, file);
+
   const aspectRatio = await getVideoAspectRatio(tempFilePath);
   const processedFilePath = await processVideoForFastStart(tempFilePath);
 
-  let key = `${aspectRatio}/${videoId}.mp4`;
+  const key = `${aspectRatio}/${videoId}.mp4`;
   await uploadVideoToS3(cfg, key, processedFilePath, "video/mp4");
 
-  const videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${key}`;
+  const videoURL = `${cfg.s3CfDistribution}/${key}`;
   video.videoURL = videoURL;
   updateVideo(cfg.db, video);
 
   await Promise.all([
     rm(tempFilePath, { force: true }),
-    rm(processedFilePath, { force: true }),
+    rm(`${tempFilePath}.processed.mp4`, { force: true }),
   ]);
-
   return respondWithJSON(200, video);
 }
 
-export async function getVideoAspectRatio(
-  filepath: string
-): Promise<"landscape" | "portrait" | "other"> {
-  const TOLERANCE = 0.05;
-
-  const proc = Bun.spawn(
+export async function getVideoAspectRatio(filePath: string) {
+  const process = Bun.spawn(
     [
       "ffprobe",
       "-v",
@@ -76,7 +72,7 @@ export async function getVideoAspectRatio(
       "stream=width,height",
       "-of",
       "json",
-      filepath,
+      filePath,
     ],
     {
       stdout: "pipe",
@@ -84,44 +80,33 @@ export async function getVideoAspectRatio(
     }
   );
 
-  const stdout = await new Response(proc.stdout).text();
-  const stderr = await new Response(proc.stderr).text();
+  const outputText = await new Response(process.stdout).text();
+  const errorText = await new Response(process.stderr).text();
 
-  const exited = await proc.exited;
+  const exitCode = await process.exited;
 
-  if (exited !== 0) {
-    throw new Error(`ffprobe failed with exit code ${exited}: ${stderr}`);
+  if (exitCode !== 0) {
+    throw new Error(`ffprobe error: ${errorText}`);
   }
 
-  let width: number, height: number;
-  try {
-    const json = JSON.parse(stdout);
-    width = json.streams?.[0]?.width;
-    height = json.streams?.[0]?.height;
-    if (!width || !height)
-      throw new Error("Width or height not found in ffprobe output");
-  } catch (e) {
-    console.error("Error parsing ffprobe output:", e);
-    throw e;
+  const output = JSON.parse(outputText);
+  if (!output.streams || output.streams.length === 0) {
+    throw new Error("No video streams found");
   }
 
-  const ratio = width / height;
+  const { width, height } = output.streams[0];
 
-  if (Math.abs(ratio - 16 / 9) < TOLERANCE) {
-    return "landscape";
-  } else if (Math.abs(ratio - 9 / 16) < TOLERANCE) {
-    return "portrait";
-  } else {
-    return "other";
-  }
+  return width === Math.floor(16 * (height / 9))
+    ? "landscape"
+    : height === Math.floor(16 * (width / 9))
+    ? "portrait"
+    : "other";
 }
 
-async function processVideoForFastStart(
-  inputFilePath: string
-): Promise<string> {
-  const outputFilePath = inputFilePath + ".processed";
+export async function processVideoForFastStart(inputFilePath: string) {
+  const processedFilePath = `${inputFilePath}.processed.mp4`;
 
-  const proc = Bun.spawn(
+  const process = Bun.spawn(
     [
       "ffmpeg",
       "-i",
@@ -134,20 +119,17 @@ async function processVideoForFastStart(
       "copy",
       "-f",
       "mp4",
-      outputFilePath,
+      processedFilePath,
     ],
-    {
-      stdout: "pipe",
-      stderr: "pipe",
-    }
+    { stderr: "pipe" }
   );
 
-  const stderr = await new Response(proc.stderr).text();
-  const exited = await proc.exited;
+  const errorText = await new Response(process.stderr).text();
+  const exitCode = await process.exited;
 
-  if (exited !== 0) {
-    throw new Error(`ffmpeg failed with exit code ${exited}: ${stderr}`);
+  if (exitCode !== 0) {
+    throw new Error(`FFmpeg error: ${errorText}`);
   }
 
-  return outputFilePath;
+  return processedFilePath;
 }
