@@ -4,6 +4,8 @@ import { getVideo, updateVideo } from "../db/videos";
 import type { ApiConfig } from "../config";
 import type { BunRequest } from "bun";
 import { BadRequestError, NotFoundError, UserForbiddenError } from "./errors";
+import path from "path";
+import { randomBytes } from "crypto";
 
 export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
   const { videoId } = req.params as { videoId?: string };
@@ -46,10 +48,24 @@ export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
     throw new Error("Error reading file data");
   }
 
-  const base64Encoded = Buffer.from(fileData).toString("base64");
-  const base64DataURL = `data:${mediaType};base64,${base64Encoded}`;
+  const allowedExtensions = ["image/jpeg", "image/png"];
 
-  video.thumbnailURL = base64DataURL;
+  const extension = file.type;
+
+  if (!extension || !allowedExtensions.includes(extension)) {
+    throw new BadRequestError("Invalid thumbnail file type");
+  }
+  const randomName = randomBytes(32).toString("base64url");
+  const thumbnailFilename = `${randomName}.${extension}`;
+  const thumbnailPath = path.join(
+    cfg.assetsRoot,
+    "thumbnails",
+    thumbnailFilename
+  );
+
+  await Bun.write(thumbnailPath, new Uint8Array(fileData));
+
+  video.thumbnailURL = `http://localhost:${cfg.port}/assets/thumbnails/${thumbnailFilename}`;
   updateVideo(cfg.db, video);
 
   return respondWithJSON(200, null);
